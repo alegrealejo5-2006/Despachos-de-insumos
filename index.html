@@ -158,6 +158,7 @@ dialog h2{font-size:26px}
   <h2>Código nuevo</h2>
   <p class="nota">Todavía no sé qué producto es. Elegilo una vez y a partir de ahora lo reconozco solo.</p>
   <div class="crudo" id="aCrudo"></div>
+  <p class="tarjeta oculto" id="aFicha" style="margin:10px 0 0"></p>
   <div id="aChipsBox" class="oculto"><p class="nota">Si el lote o el vencimiento están en el texto, tocalos: primer toque = lote, segundo = vencimiento.</p><div class="chips" id="aChips"></div></div>
   <label for="aBuscar">Producto</label>
   <input id="aBuscar" placeholder="Buscá por nombre o código" autocomplete="off">
@@ -222,7 +223,7 @@ async function api(fn, ...args){
   if(!S.api) throw new Error('Falta configurar el link de la app.');
   let r;
   try{ r = await fetch(S.api, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({fn, args}) }); }
-  catch(e){ throw new Error('Sin conexión con la planilla. Revisá señal o wifi y probá de nuevo.'); }
+  catch(e){ throw new Error(navigator.onLine===false ? 'Sin internet. Revisá señal o wifi.' : 'Google no dejó conectar. Revisá la implementación: Ejecutar como "Yo", acceso "Cualquier usuario" y que sea una versión nueva con el archivo Escaner.'); }
   let j; try{ j = await r.json(); }catch(e){ throw new Error('La app de Google no respondió bien. Revisá que el link termine en /exec y que la implementación esté actualizada.'); }
   if(!j.ok){ if(/sesi[oó]n venci/i.test(j.error)) salir(true); throw new Error(j.error); }
   return j.r;
@@ -373,6 +374,16 @@ function resolver(raw){
   return { p, art: c ? IDX.art[c] : null, lotes, via };
 }
 
+const senCache={};
+async function consultarSenasa(p){
+  const k=norm(p.senasa)+'|'+norm(p.lote);
+  if(k in senCache) return senCache[k];
+  estado('Buscando el producto en SENASA…'); S.pausa=true;
+  try{ senCache[k] = await api('escIdentificar', S.token, p.senasa, p.lote||''); }
+  catch(e){ senCache[k]=null; }
+  finally{ S.pausa=false; }
+  return senCache[k];
+}
 function registrarLectura(r, res, doc){
   S.lect.push({ t:new Date().toISOString(), texto:r.p.raw, c:r.art?r.art.c:'', lote:r.p.lote, vto:r.p.vto, serie:r.p.serie, res, doc: doc||'' });
   if(S.lect.length>=15) enviarLecturas();
@@ -394,6 +405,12 @@ async function onScan(raw, forzar){
   S.ult=raw; S.ultT=ahora;
   if(!S.cat){ fb.mal('Todavía no se cargaron los datos. Tocá Actualizar.'); return; }
   const r = resolver(raw);
+  if(!r.art && r.p.senasa){ // identifica solo con la ficha pública de SENASA
+    const info = await consultarSenasa(r.p);
+    if(info && info.c){ S.cat.reglas=info.reglas; LS.set('esc_cat',S.cat); indexar(); aviso('Reconocido por SENASA: '+(IDX.art[info.c]||{}).d); return onScan(raw,true); }
+    fb.duda(info&&info.ficha ? 'SENASA dice '+info.ficha.marca+': confirmá cuál es' : 'Código nuevo: decime qué producto es');
+    registrarLectura(r,'DESCONOCIDO'); return aprender(r, info);
+  }
   if(!r.art){ fb.duda('Código nuevo: decime qué producto es'); registrarLectura(r,'DESCONOCIDO'); return aprender(r); }
   try{ localStorage.setItem('esc_cam', JSON.stringify(S.camId||'')); }catch(e){}
   if(S.modo==='consultar') return consultar(r);
@@ -426,6 +443,7 @@ function guardarIng(){ LS.set('esc_ing', S.ing); }
 async function ingresar(r){
   let {art, p} = r;
   if(p.serie && S.ing.grupos.some(g=>g.series.includes(p.serie))){ registrarLectura(r,'DUPLICADO'); return fb.mal('Ese envase ya lo escaneaste (serie '+p.serie+').'); }
+  if(p.lote && !p.vto && p.senasa){ const info=await consultarSenasa(p); if(info && info.vto){ p.vto=info.vto; if(!p.elab) p.elab=info.elab||''; } }
   if(!p.lote || !p.vto){
     const d = await pedirDatos(r, !p.lote, !p.vto); if(!d) return estado('Lectura cancelada');
     p.lote = p.lote || d.lote; p.vto = p.vto || d.vto;
@@ -572,8 +590,11 @@ function chipsDe(box, raw, sel){
     if(sel.cb) sel.cb(tk); });
   return tk.length;
 }
-function aprender(r){
-  const p=r.p, dlg=$('#dlgAprender'), sel={lote:-1,vto:-1};
+function aprender(r, info){
+  const p=r.p, dlg=$('#dlgAprender'), sel={lote:-1,vto:-1}, f=info&&info.ficha;
+  S.sug = (info&&info.sugeridos)||[];
+  $('#aFicha').innerHTML = f ? `<b>SENASA:</b> ${esc(f.marca)} · ${esc(f.envase)} · ${esc(f.empresa)}${f.registro?' · registro '+esc(f.registro):''}` : '';
+  $('#aFicha').classList.toggle('oculto', !f);
   S.pausa=true;
   $('#aCrudo').textContent = p.raw + (p.lote?`  →  lote ${p.lote}`:'') + (p.vto?` · vto ${fFecha(p.vto)}`:'');
   const conChips = p.tipo==='TEXTO' && tokens(p.raw).length>1 && !p.lote;
@@ -601,7 +622,9 @@ function aprender(r){
 }
 function buscarArt(q){
   const w = norm(q) ? q.toUpperCase().split(/\s+/).filter(Boolean) : [];
-  const lista = (S.cat?S.cat.articulos:[]).filter(a=>{ const t=(a.c+' '+a.d).toUpperCase(); return w.every(x=>t.includes(x)); }).slice(0,40);
+  let lista = (S.cat?S.cat.articulos:[]).filter(a=>{ const t=(a.c+' '+a.d).toUpperCase(); return w.every(x=>t.includes(x)); });
+  if(!w.length && S.sug && S.sug.length){ const sg=S.sug.map(c=>IDX.art[c]).filter(Boolean); lista = sg.concat(lista.filter(a=>!S.sug.includes(a.c))); }
+  lista = lista.slice(0,40);
   $('#aRes').innerHTML = lista.map(a=>`<button data-c="${esc(a.c)}"><b>${esc(a.d)}</b><br><span class="nota">${esc(a.c)}${a.id?' · '+esc(a.id):''}</span></button>`).join('') || '<p class="nota">Sin resultados.</p>';
 }
 function pedirDatos(r, faltaLote, faltaVto){
