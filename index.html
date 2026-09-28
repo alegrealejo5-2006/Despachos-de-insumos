@@ -222,8 +222,9 @@ const fb = {
 async function api(fn, ...args){
   if(!S.api) throw new Error('Falta configurar el link de la app.');
   let r;
-  try{ r = await fetch(S.api, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({fn, args}) }); }
-  catch(e){ throw new Error(navigator.onLine===false ? 'Sin internet. Revisá señal o wifi.' : 'Google no dejó conectar. Revisá la implementación: Ejecutar como "Yo", acceso "Cualquier usuario" y que sea una versión nueva con el archivo Escaner.'); }
+  const ctl = window.AbortController ? new AbortController() : null; const t = ctl && setTimeout(()=>ctl.abort(), 30000);
+  try{ r = await fetch(S.api, { method:'POST', headers:{'Content-Type':'text/plain;charset=utf-8'}, body: JSON.stringify({fn, args}), signal: ctl?ctl.signal:undefined }); clearTimeout(t); }
+  catch(e){ clearTimeout(t); if(e.name==='AbortError') throw new Error('La planilla tardó demasiado en responder. Probá de nuevo.'); throw new Error(navigator.onLine===false ? 'Sin internet. Revisá señal o wifi.' : 'Google no dejó conectar. Revisá la implementación: Ejecutar como "Yo", acceso "Cualquier usuario" y que sea una versión nueva con el archivo Escaner.'); }
   let j; try{ j = await r.json(); }catch(e){ throw new Error('La app de Google no respondió bien. Revisá que el link termine en /exec y que la implementación esté actualizada.'); }
   if(!j.ok){ if(/sesi[oó]n venci/i.test(j.error)) salir(true); throw new Error(j.error); }
   return j.r;
@@ -376,13 +377,16 @@ function resolver(raw){
 
 const senCache={};
 async function consultarSenasa(p){
+  // Nunca frena la cámara: si SENASA no contesta en 4 segundos, sigue sin esperar
+  // (la consulta termina igual en el servidor y lo que aprenda queda para la próxima lectura).
   const k=norm(p.senasa)+'|'+norm(p.lote);
   if(k in senCache) return senCache[k];
-  estado('Buscando el producto en SENASA…'); S.pausa=true;
-  try{ senCache[k] = await api('escIdentificar', S.token, p.senasa, p.lote||''); }
-  catch(e){ senCache[k]=null; }
-  finally{ S.pausa=false; }
-  return senCache[k];
+  if(S.senasaOff && Date.now()<S.senasaOff) return null;
+  estado('Consultando SENASA…');
+  const x = await Promise.race([ api('escIdentificar', S.token, p.senasa, p.lote||'').catch(()=>null),
+                                 new Promise(r=>setTimeout(()=>r('TIEMPO'),4000)) ]);
+  if(x==='TIEMPO'){ S.senasaOff=Date.now()+5*60000; setTimeout(()=>cargarCatalogo().catch(()=>{}),20000); return null; }
+  senCache[k]=x; return x;
 }
 function registrarLectura(r, res, doc){
   S.lect.push({ t:new Date().toISOString(), texto:r.p.raw, c:r.art?r.art.c:'', lote:r.p.lote, vto:r.p.vto, serie:r.p.serie, res, doc: doc||'' });
@@ -707,7 +711,7 @@ async function bucle(){
     cv.width=Math.round(sw*k); cv.height=Math.round(sh*k);
     cx.drawImage(video,sx,sy,sw,sh,0,0,cv.width,cv.height);
     try{ const res = await readBarcodes(cx.getImageData(0,0,cv.width,cv.height), OPC);
-      const b = res.find(x=>x.isValid && x.text); if(b) await onScan(b.text); }
+      const b = res.find(x=>x.isValid && x.text); if(b && !S.ocupado){ S.ocupado=true; onScan(b.text).catch(e=>console.warn(e)).finally(()=>{ S.ocupado=false; }); } }
     catch(e){ console.warn(e); }
   }
   setTimeout(bucle, 50);
